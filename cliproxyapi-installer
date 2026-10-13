@@ -12,6 +12,9 @@ REPO_NAME="CLIProxyAPI"
 INSTALL_DIR="$HOME/cliproxyapi"
 API_URL="https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases/latest"
 SCRIPT_NAME="cliproxyapi-installer"
+DOWNLOAD_TEMP_FILE=""
+SYSTEM_SERVICE_FILE="/etc/systemd/system/cliproxyapi.service"
+USER_SERVICE_FILE="$HOME/.config/systemd/user/cliproxyapi.service"
 
 # Colors for output
 RED='\033[0;31m'
@@ -23,23 +26,23 @@ NC='\033[0m' # No Color
 
 # Logging functions
 log_info() {
-    echo -e "${BLUE}[INFO]${NC} $1"
+    echo -e "${BLUE}[INFO]${NC} $1" >&2
 }
 
 log_success() {
-    echo -e "${GREEN}[SUCCESS]${NC} $1"
+    echo -e "${GREEN}[SUCCESS]${NC} $1" >&2
 }
 
 log_warning() {
-    echo -e "${YELLOW}[WARNING]${NC} $1"
+    echo -e "${YELLOW}[WARNING]${NC} $1" >&2
 }
 
 log_error() {
-    echo -e "${RED}[ERROR]${NC} $1"
+    echo -e "${RED}[ERROR]${NC} $1" >&2
 }
 
 log_step() {
-    echo -e "${CYAN}[STEP]${NC} $1"
+    echo -e "${CYAN}[STEP]${NC} $1" >&2
 }
 
 # Display authentication information for first-time setup
@@ -290,9 +293,8 @@ show_quick_start() {
         echo -e "   ${CYAN}./cli-proxy-api${NC}"
         echo
         echo -e "${BLUE}5. Or run as a systemd service:${NC}"
-        echo -e "   ${CYAN}systemctl --user enable cliproxyapi.service${NC}"
-        echo -e "   ${CYAN}systemctl --user start cliproxyapi.service${NC}"
-        echo -e "   ${CYAN}systemctl --user status cliproxyapi.service${NC}"
+        echo -e "   ${CYAN}sudo systemctl enable --now cliproxyapi.service${NC}"
+        echo -e "   ${CYAN}sudo systemctl status cliproxyapi.service${NC}"
         echo
         echo -e "${BLUE}6. Read the full documentation:${NC}"
         echo -e "   ${CYAN}https://github.com/router-for-me/CLIProxyAPI${NC}"
@@ -301,9 +303,8 @@ show_quick_start() {
         echo -e "   ${CYAN}./cli-proxy-api${NC}"
         echo
         echo -e "${BLUE}4. Or run as a systemd service:${NC}"
-        echo -e "   ${CYAN}systemctl --user enable cliproxyapi.service${NC}"
-        echo -e "   ${CYAN}systemctl --user start cliproxyapi.service${NC}"
-        echo -e "   ${CYAN}systemctl --user status cliproxyapi.service${NC}"
+        echo -e "   ${CYAN}sudo systemctl enable --now cliproxyapi.service${NC}"
+        echo -e "   ${CYAN}sudo systemctl status cliproxyapi.service${NC}"
         echo
         echo -e "${BLUE}5. Read the full documentation:${NC}"
         echo -e "   ${CYAN}https://github.com/router-for-me/CLIProxyAPI${NC}"
@@ -323,7 +324,7 @@ detect_linux_arch() {
             ;;
         *)
             log_error "Unsupported architecture: $(uname -m). Only x86_64 and arm64 are supported on Linux."
-            exit 1
+            return 1
             ;;
     esac
 }
@@ -355,17 +356,23 @@ fetch_release_info() {
     
     local release_info
     if command -v curl >/dev/null 2>&1; then
-        release_info=$(curl -s "$API_URL")
+        if ! release_info=$(curl -fsSL --retry 2 --connect-timeout 10 --max-time 60 "$API_URL"); then
+            log_error "Failed to fetch release information from $API_URL. Check network/proxy settings and GitHub API rate limits."
+            return 1
+        fi
     else
-        release_info=$(wget -qO- "$API_URL")
+        if ! release_info=$(wget -qO- --timeout=60 --tries=3 "$API_URL"); then
+            log_error "Failed to fetch release information from $API_URL. Check network/proxy settings and GitHub API rate limits."
+            return 1
+        fi
     fi
     
     if [[ -z "$release_info" ]]; then
         log_error "Failed to fetch release information from GitHub API"
-        exit 1
+        return 1
     fi
     
-    echo "$release_info"
+    printf '%s\n' "$release_info"
 }
 
 # Extract version and download URL from release info
@@ -374,31 +381,52 @@ extract_release_info() {
     local os_arch="$2"
     
     local version
-    version=$(echo "$release_info" | grep -o '"tag_name": *"[^"]*"' | cut -d'"' -f4 | sed 's/^v//')
+    version=$(printf '%s\n' "$release_info" | grep -o '"tag_name"[[:space:]]*:[[:space:]]*"[^"]*"' | cut -d'"' -f4 | sed 's/^v//' || true)
     
     if [[ -z "$version" ]]; then
         log_error "Failed to extract version from release info"
-        exit 1
+        return 1
     fi
     
-    local expected_filename="CLIProxyAPI_${version}_${os_arch}"
-    local download_url=""
-    
-    # Handle different file extensions
+    # Upstream uses aarch64 for ARM64; older releases used arm64.
+    local platforms=("$os_arch")
+    case "$os_arch" in
+        linux_arm64|linux_aarch64)
+            platforms=("linux_aarch64" "linux_arm64")
+            ;;
+    esac
+
+    local extension="tar.gz"
     if [[ "$os_arch" == windows_* ]]; then
-        expected_filename="${expected_filename}.zip"
-    else
-        expected_filename="${expected_filename}.tar.gz"
+        extension="zip"
     fi
-    
-    download_url=$(echo "$release_info" | grep -o "\"browser_download_url\": *\"[^\"]*${expected_filename}[^\"]*\"" | cut -d'"' -f4)
-    
-    if [[ -z "$download_url" ]]; then
-        log_error "Failed to find download URL for ${expected_filename}"
-        exit 1
-    fi
-    
-    echo "${version}|${download_url}"
+
+    local asset_urls
+    asset_urls=$(printf '%s\n' "$release_info" | grep -o '"browser_download_url"[[:space:]]*:[[:space:]]*"[^"]*"' | cut -d'"' -f4 || true)
+    local platform expected_filename url
+    local download_url=""
+    for platform in "${platforms[@]}"; do
+        expected_filename="CLIProxyAPI_${version}_${platform}.${extension}"
+        while IFS= read -r url; do
+            if [[ "${url##*/}" == "$expected_filename" ]]; then
+                download_url="$url"
+                break
+            fi
+        done <<< "$asset_urls"
+        if [[ -n "$download_url" ]]; then
+            printf '%s|%s\n' "$version" "$download_url"
+            return 0
+        fi
+    done
+
+    log_error "No compatible release archive found for $os_arch (version $version; checked: ${platforms[*]})."
+    log_info "Available release assets:"
+    while IFS= read -r url; do
+        if [[ -n "$url" ]]; then
+            log_info "  ${url##*/}"
+        fi
+    done <<< "$asset_urls"
+    return 1
 }
 
 # Check if CLIProxyAPI is already installed
@@ -457,9 +485,60 @@ restore_config() {
     fi
 }
 
-# Check if systemd service is running
+# Run only system service operations with elevated privileges.
+run_as_root() {
+    if [[ "$EUID" -eq 0 ]]; then
+        "$@"
+    else
+        sudo "$@"
+    fi
+}
+
+check_service_permissions() {
+    if ! command -v systemctl >/dev/null 2>&1; then
+        log_error "System-level service installation requires Linux with systemd (systemctl)."
+        return 1
+    fi
+    if ! systemctl show --property=Version --value >/dev/null 2>&1; then
+        log_error "The systemd system manager is unavailable. Run on a Linux host booted with systemd."
+        return 1
+    fi
+    if [[ "$EUID" -ne 0 ]]; then
+        if ! command -v sudo >/dev/null 2>&1; then
+            log_error "sudo is required to install and manage the system-level service."
+            return 1
+        fi
+        if ! sudo -v; then
+            log_error "Administrator privileges are required for $SYSTEM_SERVICE_FILE."
+            return 1
+        fi
+    fi
+}
+
+# System manager reads do not require a user session or sudo.
 is_service_running() {
-    systemctl --user is-active --quiet cliproxyapi.service 2>/dev/null
+    systemctl is-active --quiet cliproxyapi.service 2>/dev/null
+}
+
+is_legacy_service_running() {
+    [[ -f "$USER_SERVICE_FILE" ]] && systemctl --user is-active --quiet cliproxyapi.service 2>/dev/null
+}
+
+is_legacy_service_enabled() {
+    [[ -f "$USER_SERVICE_FILE" ]] && systemctl --user is-enabled --quiet cliproxyapi.service 2>/dev/null
+}
+
+# Stop the old user unit before replacing its binary or starting the system unit.
+remove_legacy_user_service() {
+    if [[ -f "$USER_SERVICE_FILE" ]]; then
+        log_info "Migrating the legacy user service to the system manager..."
+        if ! systemctl --user disable --now cliproxyapi.service; then
+            log_error "Could not stop the legacy user service. Run setup-service from the original installation user's login session."
+            return 1
+        fi
+        rm -f -- "$USER_SERVICE_FILE"
+        systemctl --user daemon-reload || log_warning "Could not reload the legacy user manager"
+    fi
 }
 
 # Check if any CLIProxyAPI processes are running
@@ -508,7 +587,7 @@ stop_cliproxyapi_processes() {
 stop_service() {
     if is_service_running; then
         log_info "Stopping CLIProxyAPI service..."
-        systemctl --user stop cliproxyapi.service
+        run_as_root systemctl stop cliproxyapi.service
         log_success "Service stopped"
     else
         log_info "Service is not running"
@@ -518,28 +597,30 @@ stop_service() {
 # Start systemd service
 start_service() {
     log_info "Starting CLIProxyAPI service..."
-    systemctl --user start cliproxyapi.service
+    run_as_root systemctl start cliproxyapi.service
     
     # Wait a moment and check if it started successfully
     sleep 2
     if is_service_running; then
         log_success "Service started successfully"
     else
-        log_warning "Service may not have started properly. Check with: systemctl --user status cliproxyapi.service"
+        log_error "Service failed to start. Check with: sudo systemctl status cliproxyapi.service"
+        return 1
     fi
 }
 
 # Restart systemd service
 restart_service() {
     log_info "Restarting CLIProxyAPI service..."
-    systemctl --user restart cliproxyapi.service
+    run_as_root systemctl restart cliproxyapi.service
     
     # Wait a moment and check if it started successfully
     sleep 2
     if is_service_running; then
         log_success "Service restarted successfully"
     else
-        log_warning "Service may not have started properly. Check with: systemctl --user status cliproxyapi.service"
+        log_error "Service failed to restart. Check with: sudo systemctl status cliproxyapi.service"
+        return 1
     fi
 }
 
@@ -547,44 +628,65 @@ restart_service() {
 create_systemd_service() {
     local install_dir="$1"
     local service_file="${install_dir}/cliproxyapi.service"
-    local systemd_dir="$HOME/.config/systemd/user"
-    local systemd_service_file="${systemd_dir}/cliproxyapi.service"
+    local service_user service_group
+    service_user=$(id -un)
+    service_group=$(id -gn)
     
-    log_info "Creating systemd service file..."
-    
-    # Create systemd user directory
-    mkdir -p "$systemd_dir"
+    log_info "Creating system-level systemd service for user $service_user..."
     
     # Create service file content with basic working configuration
     cat > "$service_file" << EOF
 [Unit]
 Description=CLIProxyAPI Service
-After=network.target
+Wants=network-online.target
+After=network-online.target
 
 [Service]
 Type=simple
+User=$service_user
+Group=$service_group
 WorkingDirectory=$install_dir
 ExecStart=$install_dir/cli-proxy-api
 Restart=always
 RestartSec=10
-Environment=HOME=$HOME
+Environment="HOME=$HOME"
 
 [Install]
-WantedBy=default.target
+WantedBy=multi-user.target
 EOF
 
-    # Copy to systemd user directory
-    cp "$service_file" "$systemd_service_file"
-    
-    # Reload systemd daemon
-    systemctl --user daemon-reload || log_warning "Could not reload systemd daemon (this is normal on first run)"
+    run_as_root install -m 0644 "$service_file" "$SYSTEM_SERVICE_FILE"
+    run_as_root systemctl daemon-reload
 
     log_success "Systemd service file created: $service_file"
-    log_success "Systemd service installed: $systemd_service_file"
+    log_success "System-level service installed: $SYSTEM_SERVICE_FILE"
     log_info "To enable and start the service:"
-    log_info "  systemctl --user enable cliproxyapi.service"
-    log_info "  systemctl --user start cliproxyapi.service"
-    log_info "  systemctl --user status cliproxyapi.service"
+    log_info "  sudo systemctl enable --now cliproxyapi.service"
+    log_info "  sudo systemctl status cliproxyapi.service"
+}
+
+# Migrate or repair the service without fetching a new program release.
+setup_system_service() {
+    if [[ ! -x "${INSTALL_DIR}/cli-proxy-api" ]]; then
+        log_error "CLIProxyAPI executable not found at $INSTALL_DIR. Install it first."
+        return 1
+    fi
+    check_service_permissions
+    local was_running=false legacy_was_enabled=false
+    if is_service_running || is_legacy_service_running; then
+        was_running=true
+    fi
+    if is_legacy_service_enabled; then
+        legacy_was_enabled=true
+    fi
+    create_systemd_service "$INSTALL_DIR"
+    remove_legacy_user_service
+    if [[ "$legacy_was_enabled" == true ]]; then
+        run_as_root systemctl enable cliproxyapi.service
+    fi
+    if [[ "$was_running" == true ]]; then
+        restart_service
+    fi
 }
 
 # Copy example config if no existing config and setup main directory structure
@@ -657,14 +759,20 @@ download_file() {
     log_info "Downloading $(basename "$url")..."
     
     if command -v curl >/dev/null 2>&1; then
-        curl -L -o "$output" "$url"
+        if ! curl -fL --retry 2 --connect-timeout 10 --max-time 600 -o "$output" "$url"; then
+            log_error "Failed to download $url. Check network/proxy settings."
+            return 1
+        fi
     else
-        wget -O "$output" "$url"
+        if ! wget --timeout=60 --tries=3 -O "$output" "$url"; then
+            log_error "Failed to download $url. Check network/proxy settings."
+            return 1
+        fi
     fi
     
-    if [[ ! -f "$output" ]]; then
-        log_error "Failed to download file"
-        exit 1
+    if [[ ! -s "$output" ]]; then
+        log_error "Downloaded file is empty: $url"
+        return 1
     fi
     
     log_success "Download completed"
@@ -734,13 +842,14 @@ install_cliproxyapi() {
     current_version=$(get_current_version)
     local is_upgrade=false
     local service_was_running=false
+    local legacy_service_was_enabled=false
     
     if [[ "$current_version" != "none" ]]; then
         log_info "Current CLIProxyAPI version: $current_version"
         is_upgrade=true
         
         # Check if service is running before upgrade
-        if is_service_running; then
+        if is_service_running || is_legacy_service_running; then
             service_was_running=true
             log_info "Service is currently running and will be restarted after upgrade"
         fi
@@ -750,6 +859,10 @@ install_cliproxyapi() {
     
     # Check dependencies
     check_dependencies
+    check_service_permissions
+    if is_legacy_service_enabled; then
+        legacy_service_was_enabled=true
+    fi
     
     # Detect Linux architecture
     local os_arch
@@ -770,18 +883,9 @@ install_cliproxyapi() {
     
     # Check if already up to date
     if [[ "$is_upgrade" == true && "$current_version" == "$version" ]]; then
+        setup_system_service
         log_success "CLIProxyAPI is already up to date (version $version)"
         return
-    fi
-    
-    # Stop service and processes if running (for upgrades)
-    if [[ "$is_upgrade" == true ]]; then
-        if is_service_running; then
-            stop_service
-        fi
-        if is_cliproxyapi_running; then
-            stop_cliproxyapi_processes
-        fi
     fi
     
     # Backup existing configuration if upgrading
@@ -797,15 +901,29 @@ install_cliproxyapi() {
     # Download and extract
     local temp_file
     temp_file=$(mktemp)
+    DOWNLOAD_TEMP_FILE="$temp_file"
     
     download_file "$download_url" "$temp_file"
     extract_archive "$temp_file" "$version_dir"
     
     # Cleanup temp file
     rm -f "$temp_file"
+    DOWNLOAD_TEMP_FILE=""
     
     # Make binary executable
     make_executable "$version_dir"
+
+    # Keep the old service running until the new archive is ready, then stop
+    # both service managers before replacing the main executable.
+    remove_legacy_user_service
+    if [[ "$is_upgrade" == true ]]; then
+        if is_service_running; then
+            stop_service
+        fi
+        if is_cliproxyapi_running; then
+            stop_cliproxyapi_processes
+        fi
+    fi
     
     # Setup configuration and copy executable to main directory
     setup_config "$version_dir" "$backup_file"
@@ -815,6 +933,9 @@ install_cliproxyapi() {
     
     # Create/update systemd service file
     create_systemd_service "$INSTALL_DIR"
+    if [[ "$legacy_service_was_enabled" == true ]]; then
+        run_as_root systemctl enable cliproxyapi.service
+    fi
     
     # Write version file
     write_version_file "$INSTALL_DIR" "$version"
@@ -837,7 +958,7 @@ install_cliproxyapi() {
         elif is_service_running; then
             log_info "Service is running"
         else
-            log_info "To start the service: systemctl --user start cliproxyapi.service"
+            log_info "To enable and start the service: sudo systemctl enable --now cliproxyapi.service"
         fi
         
         # Check if this is the first time setup (no existing config)
@@ -885,10 +1006,16 @@ show_status() {
             echo "Executable: Missing"
         fi
         
-        if [[ -f "${INSTALL_DIR}/cliproxyapi.service" ]]; then
-            echo "Systemd Service: Available"
-            echo "  To enable: systemctl --user enable cliproxyapi.service"
-            echo "  To start:  systemctl --user start cliproxyapi.service"
+        if [[ -f "$SYSTEM_SERVICE_FILE" ]]; then
+            echo "Systemd Service: System-level ($SYSTEM_SERVICE_FILE)"
+            echo "  To enable and start: sudo systemctl enable --now cliproxyapi.service"
+            if is_service_running; then
+                echo "  State: Running"
+            else
+                echo "  State: Stopped"
+            fi
+        elif [[ -f "$USER_SERVICE_FILE" ]]; then
+            echo "Systemd Service: Legacy user service; migrate with $SCRIPT_NAME setup-service"
         else
             echo "Systemd Service: Missing"
         fi
@@ -934,7 +1061,15 @@ uninstall_cliproxyapi() {
         exit 0
     fi
     
-    # Remove installation directory
+    check_service_permissions
+    remove_legacy_user_service
+    if [[ -f "$SYSTEM_SERVICE_FILE" ]]; then
+        run_as_root systemctl disable --now cliproxyapi.service
+        run_as_root rm -f -- "$SYSTEM_SERVICE_FILE"
+        run_as_root systemctl daemon-reload
+    fi
+
+    # Remove installation directory after stopping and removing its service.
     log_info "Removing CLIProxyAPI installation..."
     rm -rf "$INSTALL_DIR"
     
@@ -943,15 +1078,10 @@ uninstall_cliproxyapi() {
 
 # Cleanup function on exit
 cleanup() {
-    local temp_files
-    temp_files=$(find /tmp -name "tmp.*" -user "$(whoami)" 2>/dev/null || true)
-    if [[ -n "$temp_files" ]]; then
-        echo "$temp_files" | xargs rm -f 2>/dev/null || true
+    if [[ -n "$DOWNLOAD_TEMP_FILE" ]]; then
+        rm -f -- "$DOWNLOAD_TEMP_FILE"
     fi
 }
-
-# Set up cleanup trap
-trap cleanup EXIT
 
 # Main script logic
 main() {
@@ -961,6 +1091,9 @@ main() {
             ;;
         "status")
             show_status
+            ;;
+        "setup-service")
+            setup_system_service
             ;;
         "auth")
             show_authentication_info
@@ -990,7 +1123,7 @@ main() {
                     echo -e "  ${CYAN}./cli-proxy-api${NC}"
                     echo
                     echo -e "${BLUE}Or run as a service:${NC}"
-                    echo -e "  ${CYAN}systemctl --user start cliproxyapi.service${NC}"
+                    echo -e "  ${CYAN}sudo systemctl enable --now cliproxyapi.service${NC}"
                 else
                     echo -e "❌ API Keys: ${RED}NOT CONFIGURED${NC}"
                     echo -e "❌ Status: ${RED}Not ready to run${NC}"
@@ -1031,6 +1164,7 @@ Usage: $SCRIPT_NAME [COMMAND] [OPTIONS]
 Commands:
   install, upgrade    Install or upgrade CLIProxyAPI (default)
   status             Show current installation status
+  setup-service      Install or migrate to the system-level systemd service
   auth               Show authentication setup information
   check-config       Check configuration and API keys
   generate-key       Generate new API key and show it
@@ -1049,10 +1183,12 @@ Features:
   - Downloads latest version from GitHub releases
   - Preserves configuration during upgrades
   - Automatic API key generation
-  - Systemd service file creation
+  - System-level systemd service (independent of SSH sessions)
   - Cleans up old versions (keeps latest 2)
 
 Installation Directory: ~/cliproxyapi/
+Service File: /etc/systemd/system/cliproxyapi.service
+Service installation requires root or sudo; run as the original installation user.
 
 Supported Platforms:
   - Linux: amd64, arm64
@@ -1060,6 +1196,7 @@ Supported Platforms:
 Examples:
   $SCRIPT_NAME              # Install or upgrade
   $SCRIPT_NAME status       # Show current status
+  $SCRIPT_NAME setup-service # Migrate an existing user service
   $SCRIPT_NAME auth         # Show authentication info
   $SCRIPT_NAME check-config # Check configuration
   $SCRIPT_NAME generate-key # Generate new API key
@@ -1075,5 +1212,8 @@ EOF
     esac
 }
 
-# Run main function with all arguments
-main "$@"
+# Allow sourcing functions for regression tests without running the installer.
+if [[ -z "${BASH_SOURCE[0]:-}" || "${BASH_SOURCE[0]}" == "$0" ]]; then
+    trap cleanup EXIT
+    main "$@"
+fi
